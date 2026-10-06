@@ -1,0 +1,30 @@
+{
+  "architectures": [
+    { "name": "amd64", "upstreamDir": "amd64",   "runner": "ubuntu-24.04" },
+    { "name": "arm64", "upstreamDir": "arm64v8", "runner": "ubuntu-24.04-arm" }
+  ],
+  "builds": [
+    {
+      "version": "8.0",
+      "variant": "noble",
+      "images": ["runtime-deps", "runtime", "aspnet", "sdk"],
+      "overlays": { "runtime-deps": ["apt-upgrade"] }
+    },
+    {
+      "version": "8.0",
+      "variant": "noble-chiseled-extra",
+      "images": ["runtime-deps", "runtime", "aspnet"]
+    },
+    {
+      "version": "10.0",
+      "variant": "noble",
+      "images": ["runtime-deps", "runtime", "aspnet", "sdk"],
+      "overlays": { "runtime-deps": ["apt-upgrade"] }
+    },
+    {
+      "version": "10.0",
+      "variant": "noble-chiseled-extra",
+      "images": ["runtime-deps", "runtime", "aspnet"]
+    }
+  ]
+}

@@ -1,0 +1,89 @@
+name: Bump upstream dotnet-docker
+
+# Weekly: if dotnet/dotnet-docker main has moved, open (or refresh) a PR that bumps
+# UPSTREAM_SHA in upstream.env, listing which of OUR Dockerfiles changed. New .NET
+# servicing releases and Microsoft's Dockerfile fixes arrive through this PR.
+on:
+  schedule:
+    - cron: '0 4 * * 1'   # an hour before the weekly build
+  workflow_dispatch:
+
+permissions:
+  contents: write        # push the bump branch
+  pull-requests: write   # open / update the PR
+  actions: write         # dispatch build.yml on the bump branch
+
+env:
+  BRANCH: bump/dotnet-docker
+
+jobs:
+  bump:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check for a newer upstream revision
+        id: check
+        run: |
+          source upstream.env
+          latest="$(git ls-remote "$UPSTREAM_REPO" refs/heads/main | cut -f1)"
+          [ -n "$latest" ] || { echo "::error::could not resolve upstream main"; exit 1; }
+          echo "old=$UPSTREAM_SHA" >>"$GITHUB_OUTPUT"
+          echo "new=$latest" >>"$GITHUB_OUTPUT"
+          if [ "$latest" = "$UPSTREAM_SHA" ]; then
+            echo "Upstream unchanged ($latest)."
+            echo "changed=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Summarise changes to the Dockerfiles we build
+        if: steps.check.outputs.changed == 'true'
+        env:
+          OLD: ${{ steps.check.outputs.old }}
+          NEW: ${{ steps.check.outputs.new }}
+        run: |
+          source upstream.env
+          git init --quiet /tmp/upstream
+          git -C /tmp/upstream fetch --quiet --filter=blob:none "$UPSTREAM_REPO" "$OLD" "$NEW"
+          mapfile -t paths < <(jq -r '.builds[] as $b | $b.images[] | "src/\(.)/\($b.version)/\($b.variant)/"' images.json)
+          {
+            echo "Bumps [dotnet/dotnet-docker](https://github.com/dotnet/dotnet-docker) \`${OLD:0:12}\` → \`${NEW:0:12}\`"
+            echo "([compare](https://github.com/dotnet/dotnet-docker/compare/$OLD...$NEW))."
+            echo
+            echo "### Dockerfiles we build that changed"
+            echo '```'
+            git -C /tmp/upstream diff --stat=100 "$OLD" "$NEW" -- "${paths[@]}" || true
+            echo '```'
+            echo
+            echo "Before merging, check whether any \`patches/\` or \`overlays/\` are now redundant"
+            echo "(upstream may have shipped the same fix) and remove them."
+            echo
+            echo "_The build for this branch is started by workflow dispatch; its checks show on the PR's head commit._"
+          } >/tmp/pr-body.md
+          cat /tmp/pr-body.md >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Open or update the bump PR
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW: ${{ steps.check.outputs.new }}
+        run: |
+          sed -i "s/^UPSTREAM_SHA=.*/UPSTREAM_SHA=$NEW/" upstream.env
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch --quiet -C "$BRANCH"
+          git commit --quiet -am "Bump dotnet/dotnet-docker to ${NEW:0:12}"
+          git push --force origin "$BRANCH"
+
+          title="Bump dotnet/dotnet-docker to ${NEW:0:12}"
+          if [ -n "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
+            gh pr edit "$BRANCH" --title "$title" --body-file /tmp/pr-body.md
+          else
+            gh pr create --head "$BRANCH" --title "$title" --body-file /tmp/pr-body.md
+          fi
+
+          # PRs opened with GITHUB_TOKEN don't trigger pull_request workflows;
+          # workflow_dispatch is the documented exception. Off main => never publishes.
+          gh workflow run build.yml --ref "$BRANCH" -f publish=false -f reason="upstream bump ${NEW:0:12}"

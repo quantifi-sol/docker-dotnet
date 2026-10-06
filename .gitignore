@@ -1,0 +1,4 @@
+# Upstream dotnet/dotnet-docker checkout (scripts/fetch-upstream.sh)
+/upstream/
+# Build records, scan reports and SBOMs (scripts/build-chain.sh)
+/out/

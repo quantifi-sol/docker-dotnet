@@ -1,0 +1,209 @@
+name: Build .NET images
+
+# Rebuilds the .NET base images from dotnet/dotnet-docker (pinned in upstream.env),
+# with our patches/overlays, on amd64 + arm64 (Apple Silicon). Each chain is
+# smoke-tested and Trivy-gated before anything is pushed; multi-arch tags are only
+# published when every selected chain passed.
+on:
+  push:
+    branches: [main]
+    paths:
+      - upstream.env
+      - images.json
+      - .trivyignore
+      - patches/**
+      - overlays/**
+      - scripts/**
+      - .github/workflows/build.yml
+  pull_request:
+    paths:
+      - upstream.env
+      - images.json
+      - .trivyignore
+      - patches/**
+      - overlays/**
+      - scripts/**
+      - .github/workflows/build.yml
+  schedule:
+    # Weekly, Monday 05:00 UTC. Even with no repo change this picks up Ubuntu
+    # security updates (chisel / apt-upgrade fetch current archive packages).
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+    # The CVE fast path: run this as soon as Ubuntu publishes a fix.
+    inputs:
+      reason:
+        description: 'Why (e.g. "CVE-2026-84782: libssl3t64 fix in noble-security")'
+        required: false
+      only:
+        description: 'Limit to "8.0" or "8.0/noble-chiseled-extra" (empty = everything)'
+        required: false
+      publish:
+        description: 'Push images (main only)'
+        type: boolean
+        default: true
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  TRIVY_VERSION: v0.72.0   # keep in step with toolkit-app-mcp's image scan
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      stamp: ${{ steps.plan.outputs.stamp }}
+      publish: ${{ steps.plan.outputs.publish }}
+      prefix: ${{ steps.plan.outputs.prefix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Fails on expired patches/overlays so emergency fixes don't outlive their need.
+      - name: Check patch and overlay expiry
+        run: scripts/check-expiry.sh
+
+      - name: Plan
+        id: plan
+        env:
+          ONLY: ${{ inputs.only }}
+          PUBLISH_INPUT: ${{ inputs.publish }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          matrix="$(jq -c --arg only "$ONLY" '
+            [ .builds[] as $b | .architectures[] as $a
+              | select($only == "" or $only == $b.version or $only == ($b.version + "/" + $b.variant))
+              | {version: $b.version, variant: $b.variant, arch: $a.name, runner: $a.runner} ]' images.json)"
+          if [ "$(jq length <<<"$matrix")" -eq 0 ]; then
+            echo "::error::'$ONLY' matches no build in images.json"; exit 1
+          fi
+
+          case "$GITHUB_EVENT_NAME" in
+            pull_request)      publish=false ;;
+            workflow_dispatch) publish="$PUBLISH_INPUT" ;;
+            *)                 publish=true ;;
+          esac
+          # Only main publishes; dispatches on other branches are build + scan only.
+          [ "$GITHUB_REF" = refs/heads/main ] || publish=false
+
+          owner="$(tr '[:upper:]' '[:lower:]' <<<"$GITHUB_REPOSITORY_OWNER")"
+          {
+            echo "matrix=$matrix"
+            echo "stamp=$(date -u +%Y%m%d)-$GITHUB_RUN_NUMBER"
+            echo "publish=$publish"
+            echo "prefix=$REGISTRY/$owner/dotnet"
+          } >>"$GITHUB_OUTPUT"
+
+          {
+            echo "### Plan"
+            echo "- Trigger: \`$GITHUB_EVENT_NAME\`${REASON:+ -- $REASON}"
+            echo "- Upstream: \`$(grep ^UPSTREAM_SHA= upstream.env | cut -d= -f2)\`"
+            echo "- Publish: \`$publish\`"
+            echo "- Chains: $(jq -r 'map("\(.version)/\(.variant)/\(.arch)") | join(", ")' <<<"$matrix")"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: plan
+    name: ${{ matrix.version }} ${{ matrix.variant }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}   # native arm64 runners, no QEMU
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # Authenticate the Trivy DB pull from GHCR to avoid anonymous rate limits.
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        if: needs.plan.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Upstream Dockerfiles pull buildpack-deps from Docker Hub. Optional login
+      # (repo variable DOCKERHUB_USERNAME + secret DOCKERHUB_TOKEN) avoids rate limits.
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # install.sh from the pinned tag verifies the release checksum.
+      - name: Install Trivy
+        run: |
+          curl -sSfL "https://raw.githubusercontent.com/aquasecurity/trivy/$TRIVY_VERSION/contrib/install.sh" \
+            | sh -s -- -b /usr/local/bin "$TRIVY_VERSION"
+          trivy --version
+
+      - name: Fetch upstream and apply patches
+        run: scripts/fetch-upstream.sh
+
+      - name: Build, smoke-test, scan${{ needs.plan.outputs.publish == 'true' && ', push' || '' }}
+        env:
+          VERSION: ${{ matrix.version }}
+          VARIANT: ${{ matrix.variant }}
+          ARCH: ${{ matrix.arch }}
+          STAMP: ${{ needs.plan.outputs.stamp }}
+          PUBLISH: ${{ needs.plan.outputs.publish }}
+          PREFIX: ${{ needs.plan.outputs.prefix }}
+        run: |
+          args=(--version "$VERSION" --variant "$VARIANT" --arch "$ARCH" --stamp "$STAMP")
+          if [ "$PUBLISH" = true ]; then args+=(--push-prefix "$PREFIX"); fi
+          scripts/build-chain.sh "${args[@]}"
+
+      # Build record (base image digests, upstream rev, patches, pushed digests),
+      # SBOMs and scan output -- kept even when the gate fails, for triage.
+      - name: Upload build record, SBOMs and scan reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.version }}-${{ matrix.variant }}-${{ matrix.arch }}
+          path: out/
+          if-no-files-found: ignore
+          retention-days: 90
+
+  publish:
+    needs: [plan, build]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download build records
+        uses: actions/download-artifact@v4
+        with:
+          pattern: build-*
+          path: records
+          merge-multiple: true
+
+      - name: Publish multi-arch tags
+        env:
+          PREFIX: ${{ needs.plan.outputs.prefix }}
+        run: scripts/publish-manifests.sh --records records --push-prefix "$PREFIX"
