@@ -121,23 +121,8 @@ make check                                   # expiry + script lint (run before 
 `make` only re-fetches upstream when `upstream.env` or a patch changes (`make fetch` forces it).
 The Makefile is a thin wrapper; CI calls the `scripts/` directly.
 
-## Setup checklist
-
-- [ ] Create the GitHub repo and push this folder.
-- [ ] Settings → Actions → Workflow permissions: allow GitHub Actions to **create pull requests** (for `bump-upstream.yml`).
-- [ ] Docker Hub: create an access token with **Read & Write** for `quantifisol` and store it
-      as the repo secret **`DOCKERHUB_TOKEN`**. If you log in as a different user than
-      `quantifisol` (e.g. a member of a `quantifisol` organization), also set the repo
-      variable `DOCKERHUB_USERNAME`. Publishing runs fail fast if the secret is missing.
-- [ ] Docker Hub: check new repos are created **public** (the account's default
-      repository privacy), or create the four `dotnet-*` repos up front.
-- [ ] Private repo: the `ubuntu-24.04-arm` runners need a plan that includes them (free for public repos).
-- [ ] Optional hardening: pin `actions/*` and `docker/*` to commit SHAs, as toolkit-app-mcp does for third-party actions.
-
 ## Trade-offs to keep in mind
 
-- These images are **ours**: Microsoft's signatures and provenance don't apply. Consider
-  adding cosign signing / `actions/attest-build-provenance` before using this in production.
 - If upstream renames a variant (e.g. `noble` → `resolute`), the build fails loudly with
   "missing Dockerfile -- did upstream rename the variant?". Update `images.json`.
 - The full matrix is 8 chains (28 image builds) running in parallel. A CVE rebuild of one
