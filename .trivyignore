@@ -1,0 +1,4 @@
+# Accepted vulnerabilities for the Trivy gate (scripts/build-chain.sh).
+# One ID per line, always with an expiry so the exception lapses on its own:
+#   CVE-2026-12345 exp:2026-12-31   # reason, reachability assessment, ticket
+# Only for CVEs Ubuntu hasn't fixed yet -- see the CVE runbook in README.md.
