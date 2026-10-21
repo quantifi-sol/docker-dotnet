@@ -1,0 +1,127 @@
+name: Scan published .NET images
+
+# Daily re-scan of the multi-arch tags build.yml published. CVEs are disclosed after an
+# image ships; the build-time gate can't see those. A failure here means a published
+# image now has a fixable CRITICAL CVE: follow the CVE runbook in README.md (usually
+# just "Run workflow" on build.yml). Unfixed findings are reported, not failed.
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      only:
+        description: 'Limit to "8.0" or "8.0/noble-chiseled-extra" (empty = everything)'
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  TRIVY_VERSION: v0.72.0   # keep in step with build.yml
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      prefix: ${{ steps.plan.outputs.prefix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Plan
+        id: plan
+        env:
+          ONLY: ${{ inputs.only }}
+        run: |
+          matrix="$(jq -c --arg only "$ONLY" '
+            [ .builds[] as $b | .architectures[] as $a
+              | select($only == "" or $only == $b.version or $only == ($b.version + "/" + $b.variant))
+              | {version: $b.version, variant: $b.variant, arch: $a.name} ]' images.json)"
+          if [ "$(jq length <<<"$matrix")" -eq 0 ]; then
+            echo "::error::'$ONLY' matches no build in images.json"; exit 1
+          fi
+          # Same prefix as build.yml's plan job, so we scan exactly what it publishes.
+          owner="$(tr '[:upper:]' '[:lower:]' <<<"$GITHUB_REPOSITORY_OWNER")"
+          {
+            echo "matrix=$matrix"
+            echo "prefix=$REGISTRY/$owner/dotnet"
+          } >>"$GITHUB_OUTPUT"
+
+  scan:
+    needs: plan
+    name: ${{ matrix.version }} ${{ matrix.variant }} ${{ matrix.arch }}
+    runs-on: ubuntu-24.04   # remote scan of the arm64 image; no arm runner needed
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+    permissions:
+      contents: read
+      packages: read
+    env:
+      # Authenticate the Trivy DB pull from GHCR to avoid anonymous rate limits.
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Trivy reads registry credentials from the docker config this writes.
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # install.sh from the pinned tag verifies the release checksum.
+      - name: Install Trivy
+        run: |
+          curl -sSfL "https://raw.githubusercontent.com/aquasecurity/trivy/$TRIVY_VERSION/contrib/install.sh" \
+            | sh -s -- -b /usr/local/bin "$TRIVY_VERSION"
+          trivy --version
+
+      - name: Scan
+        env:
+          VERSION: ${{ matrix.version }}
+          VARIANT: ${{ matrix.variant }}
+          ARCH: ${{ matrix.arch }}
+          PREFIX: ${{ needs.plan.outputs.prefix }}
+        run: |
+          set -o pipefail   # the gate's exit code must survive `| tee`
+          key="$VERSION-$VARIANT-$ARCH"
+          mkdir -p "out/$key"
+          ignore=(--quiet --scanners vuln --ignorefile .trivyignore --platform "linux/$ARCH")
+          failed=0
+          for img in $(jq -r --arg v "$VERSION" --arg n "$VARIANT" \
+              '.builds[] | select(.version == $v and .variant == $n) | .images[]' images.json); do
+            ref="$PREFIX$img:$VERSION-$VARIANT"
+            echo "::group::Scan $ref ($ARCH)"
+            # Blocking: fixable CRITICAL in any package type (OS or .NET library).
+            if ! trivy image "${ignore[@]}" --severity CRITICAL --ignore-unfixed --exit-code 1 \
+                "$ref" | tee "out/$key/$img.gate.txt"; then
+              echo "::error::$ref ($ARCH) has fixable CRITICAL vulnerabilities -- rebuild (see CVE runbook)"
+              failed=1
+            fi
+            # Report: CRITICAL with no fix released yet.
+            trivy image "${ignore[@]}" --severity CRITICAL --format json --output "out/$key/$img.unfixed.json" "$ref"
+            unfixed="$(jq -r '[.Results[]? | .Vulnerabilities[]? | select((.FixedVersion // "") == "")
+                | "\(.VulnerabilityID)  \(.PkgName) \(.InstalledVersion) (\(.Status // "no fix"))"] | unique | .[]' \
+              "out/$key/$img.unfixed.json")"
+            if [ -n "$unfixed" ]; then
+              echo "::warning::$ref ($ARCH): $(wc -l <<<"$unfixed" | tr -d ' ') CRITICAL finding(s) with no fix released (assess reachability)"
+              sed 's/^/    /' <<<"$unfixed"
+            fi
+            echo "::endgroup::"
+          done
+          exit "$failed"
+
+      - name: Upload scan reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-${{ matrix.version }}-${{ matrix.variant }}-${{ matrix.arch }}
+          path: out/
+          if-no-files-found: ignore
+          retention-days: 30

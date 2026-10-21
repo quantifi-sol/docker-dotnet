@@ -185,15 +185,26 @@ echo "::endgroup::"
 # Scan policy -- block only on what a rebuild or patch here can fix:
 #   gate (blocking):   OS packages (TRIVY_GATE_PKG_TYPES, default "os"). Ubuntu ships the
 #                      fix, we rebuild. Accepted risks go in .trivyignore (with exp:).
-#   report (warning):  .NET libraries inside Microsoft's runtime/SDK tarballs. Only a new
+#   library (mixed):   .NET libraries inside Microsoft's runtime/SDK tarballs. Only a new
 #                      .NET/SDK release fixes those, and it arrives via the upstream bump
-#                      PR; blocking on them would also block an urgent OS-CVE rebuild.
-#                      Consuming apps' own image scans still gate on shipped libraries.
-# Both use HIGH/CRITICAL + --ignore-unfixed, matching toolkit-app-mcp.
+#                      PR. CRITICAL findings block (TRIVY_BLOCK_LIBRARY_SEVERITY, set it
+#                      empty to report only); the rest are warnings. If one would hold up
+#                      an urgent OS-CVE rebuild, add an expiring .trivyignore entry.
+#   unfixed (warning): CRITICAL findings with no fix released yet. Nothing to rebuild, so
+#                      they're reported (<image>.unfixed.json) for a reachability check.
+# The gates use HIGH/CRITICAL + --ignore-unfixed, matching toolkit-app-mcp.
 if [[ $scan -eq 1 ]]; then
   gate_types="${TRIVY_GATE_PKG_TYPES:-os}"
   severity="${TRIVY_SEVERITY:-HIGH,CRITICAL}"
-  common=(--quiet --scanners vuln --severity "$severity" --ignore-unfixed --ignorefile "$root/.trivyignore")
+  # Must be within $severity: it filters the library scan below rather than re-scanning.
+  library_block="${TRIVY_BLOCK_LIBRARY_SEVERITY-CRITICAL}"
+  ignore=(--quiet --scanners vuln --ignorefile "$root/.trivyignore")
+  common=("${ignore[@]}" --severity "$severity" --ignore-unfixed)
+  # shellcheck disable=SC2016  # jq program, not shell
+  list='[.Results[]? | .Vulnerabilities[]?
+      | select(((.Severity as $v | $sev | index($v)) != null) == ($keep == "match"))
+      | "\(.VulnerabilityID)  \(.Severity)  \(.PkgName) \(.InstalledVersion) (fixed in \(.FixedVersion // "-"))"]
+    | unique | .[]'
   gate_failed=0
   for img in "${images[@]}"; do
     ref="$local_repo/$img:$local_tag"
@@ -207,15 +218,30 @@ if [[ $scan -eq 1 ]]; then
 
     if [[ ",$gate_types," != *",library,"* ]]; then
       trivy image "${common[@]}" --pkg-types library --format json --output "$out/$img.library.json" "$ref"
-      findings="$(jq -r '[.Results[]? | .Vulnerabilities[]?
-          | "\(.VulnerabilityID)  \(.PkgName) \(.InstalledVersion) (fixed in \(.FixedVersion))"]
-        | unique | .[]' "$out/$img.library.json")"
+      sev="$(jq -c --arg s "$library_block" '$s | split(",") | map(select(. != ""))' <<<null)"
+      blocking=""
+      if [[ -n "$library_block" ]]; then
+        blocking="$(jq -r --argjson sev "$sev" --arg keep match "$list" "$out/$img.library.json")"
+      fi
+      findings="$(jq -r --argjson sev "$sev" --arg keep other "$list" "$out/$img.library.json")"
+      if [[ -n "$blocking" ]]; then
+        echo "::error::$img ($key): $(wc -l <<<"$blocking" | tr -d ' ') $library_block .NET library finding(s) (blocking; needs a newer .NET/SDK release or an expiring .trivyignore entry -- see $img.library.json)"
+        sed 's/^/    /' <<<"$blocking"
+        gate_failed=1
+      fi
       if [[ -n "$findings" ]]; then
         echo "::warning::$img ($key): $(wc -l <<<"$findings" | tr -d ' ') .NET library finding(s) in Microsoft-shipped components (not blocking; needs a newer .NET/SDK release -- see $img.library.json)"
         sed 's/^/    /' <<<"$findings"
-      else
-        echo ".NET libraries: no fixable $severity findings"
       fi
+      [[ -n "$blocking$findings" ]] || echo ".NET libraries: no fixable $severity findings"
+    fi
+
+    trivy image "${ignore[@]}" --severity CRITICAL --format json --output "$out/$img.unfixed.json" "$ref"
+    unfixed="$(jq -r '[.Results[]? | .Vulnerabilities[]? | select((.FixedVersion // "") == "")
+        | "\(.VulnerabilityID)  \(.PkgName) \(.InstalledVersion) (\(.Status // "no fix"))"] | unique | .[]' "$out/$img.unfixed.json")"
+    if [[ -n "$unfixed" ]]; then
+      echo "::warning::$img ($key): $(wc -l <<<"$unfixed" | tr -d ' ') CRITICAL finding(s) with no fix released (not blocking; assess reachability -- see $img.unfixed.json)"
+      sed 's/^/    /' <<<"$unfixed"
     fi
     echo "::endgroup::"
   done
