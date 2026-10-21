@@ -66,13 +66,19 @@ upstream.env ──► fetch-upstream.sh ──► patches/*.patch ──► bui
   `--ignore-unfixed`, `.trivyignore` with `exp:`) scans every image.
   - **OS packages block.** A rebuild or patch here can fix them. Nothing is pushed unless
     the whole chain passes, and multi-arch tags only move when every architecture passed.
-  - **.NET libraries are reported, not blocking.** These are NuGet packages inside
+  - **.NET libraries block on CRITICAL, warn on HIGH.** These are NuGet packages inside
     Microsoft's runtime/SDK tarballs (e.g. MSBuild or `dotnet-format` dependencies in the
-    SDK). Only a new .NET/SDK release fixes them, so they show as warnings plus
-    `<image>.library.json`, and the fix arrives through the upstream bump PR. Blocking
-    on them would also block an urgent OS-CVE rebuild. Your app repos' image scans
-    still gate on the libraries they actually ship. Set `TRIVY_GATE_PKG_TYPES=os,library`
-    to make them blocking again.
+    SDK). Only a new .NET/SDK release fixes them, and it arrives through the upstream bump
+    PR. Findings are listed in `<image>.library.json`. If a critical library CVE would hold
+    up an urgent OS-CVE rebuild, add an expiring `.trivyignore` entry. Set
+    `TRIVY_BLOCK_LIBRARY_SEVERITY=` (empty) to only report them, or
+    `TRIVY_GATE_PKG_TYPES=os,library` to block on HIGH too.
+  - **Unfixed CRITICALs are reported, not blocking.** `--ignore-unfixed` keeps the gates
+    to what a rebuild can fix; CRITICAL findings with no released fix show as warnings
+    plus `<image>.unfixed.json`, for a reachability check.
+- **Published images are re-scanned daily** ([`scan-published.yml`](.github/workflows/scan-published.yml)):
+  every published tag, both architectures, failing on any fixable CRITICAL (OS or
+  library). That catches CVEs disclosed after an image shipped; a red run means rebuild.
 - **Records:** each run uploads `build.json` (upstream revision, patches, base image
   digests, pushed digests), CycloneDX SBOMs and scan output as artifacts.
 
@@ -85,16 +91,21 @@ upstream.env ──► fetch-upstream.sh ──► patches/*.patch ──► bui
 | Pull request | everything | no |
 | **Run workflow** (manual) | everything, or `only: 8.0` / `8.0/noble-chiseled-extra` | yes on `main` |
 | `bump-upstream.yml` (Mon 04:00 UTC) | opens/refreshes a PR bumping `UPSTREAM_SHA` and starts a build on it | no |
+| `scan-published.yml` (daily 06:00 UTC) | nothing: scans the published tags, fails on fixable CRITICALs | no |
 
 ## CVE runbook
+
+A CVE usually shows up as a failed *Scan published .NET images* run or a failed build gate.
 
 1. **Find out who has to ship the fix.** Look up the CVE on the
    [Ubuntu CVE tracker](https://ubuntu.com/security/cves) for `noble`.
    - **Released** in Ubuntu: go to step 2. This is the case we built this for.
    - **Needed / deferred** (no Ubuntu fix): rebuilding can't help. Assess
      reachability and add an expiring `.trivyignore` entry, as toolkit-app-mcp does.
-   - **In .NET itself** (runtime/ASP.NET Core): wait for Microsoft's servicing
-     release; it arrives through the weekly bump PR.
+   - **In .NET itself** (runtime/ASP.NET Core, or a NuGet library Microsoft ships): wait
+     for Microsoft's servicing release; it arrives through the weekly bump PR. A CRITICAL
+     one blocks our builds meanwhile, so add an expiring `.trivyignore` entry if a
+     rebuild is needed before then.
 2. **Rebuild:** Actions → *Build .NET images* → *Run workflow* on `main`, with
    `reason: CVE-…` and optionally `only: 8.0/noble-chiseled-extra`. The scan output in
    the run confirms the package version changed.
