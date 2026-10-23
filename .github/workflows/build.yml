@@ -25,9 +25,10 @@ on:
       - scripts/**
       - .github/workflows/build.yml
   schedule:
-    # Weekly, Monday 05:00 UTC. Even with no repo change this picks up Ubuntu
-    # security updates (chisel / apt-upgrade fetch current archive packages).
-    - cron: '0 5 * * 1'
+    # Weekly, Monday 09:00 UK time (follows GMT/BST). Even with no repo change this
+    # picks up Ubuntu security updates (chisel / apt-upgrade fetch current archive packages).
+    - cron: '0 9 * * 1'
+      timezone: 'Europe/London'
   workflow_dispatch:
     # The CVE fast path: run this as soon as Ubuntu publishes a fix.
     inputs:

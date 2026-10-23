@@ -5,7 +5,7 @@ name: Bump upstream dotnet-docker
 # servicing releases and Microsoft's Dockerfile fixes arrive through this PR.
 on:
   schedule:
-    - cron: '0 4 * * 1'   # an hour before the weekly build
+    - cron: '0 4 * * 1'   # before the weekly build (Monday 09:00 UK)
   workflow_dispatch:
 
 permissions:
